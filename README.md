@@ -73,6 +73,28 @@ The game is modelled as a **Markov Decision Process**:
 - **"Never flap" outperforms random and "always flap"**: The effort cost (λ) is paid immediately, while survival reward accumulates — so flapping carelessly is worse than waiting.
 - The **flap rate** is the single most useful diagnostic during training: too high → wasted energy; too low → crashes from gravity.
 
+### Implementation Decisions
+
+#### Task 1 — `build_observation`
+- Use `obs_mode = "full"` with `n_preview` pipes ahead (not the minimal `(v, dy0)` baseline)
+- Bird height `y` is **re-centred** on mid-grid `(C.Y-1)/2` before scaling — so 0 = middle, helping the network treat up/down symmetrically
+- All features divided by fixed `scales(C)` constants (no running normaliser — avoids coupling runs to their own history)
+- **`active` flag is essential**: without it, empty pipe slots (sentinel `dx = X`) are indistinguishable from genuinely distant obstacles
+- Observation dim: `2 + 3 × n_preview` (y, v, then dx/dy/active per pipe)
+
+#### Task 2 — `compute_gae`
+- Implemented as a **backward loop** (t = T-1 → 0) because `A_t` depends on `A_{t+1}`
+- The `(1 - done_t)` mask appears **twice**: once in the TD error (zeroes out next-state value on crash), once in the accumulation (prevents credit leaking across episode boundaries)
+- Returns = advantages + values (critic regression target = full expected return, not just advantage)
+- λ controls the "memory fade" — calibrated analytically in C3
+
+#### Task 3 — `ppo_loss`
+- Ratio ρ = `exp(log π_new - log π_old)` computed in log-space for numerical stability
+- Pessimistic clipping: `torch.max(pg_1, pg_2)` — both terms carry a minus sign, so `max` picks the worse (less beneficial) branch, enforcing the leash
+- Value loss: `0.5 * MSE(V, returns)` — the `0.5` matches the gradient scale convention
+- Entropy bonus subtracted (rewarded) to prevent premature policy collapse
+- KL estimator: Schulman's `mean((ρ - 1) - log ρ)` — always ≥ 0, lower variance than `-log ρ`; used in C3 to set learning rate
+
 ---
 
 ## Hyperparameters
