@@ -76,24 +76,97 @@ The game is modelled as a **Markov Decision Process**:
 ### Implementation Decisions
 
 #### Task 1 — `build_observation`
+
 - Use `obs_mode = "full"` with `n_preview` pipes ahead (not the minimal `(v, dy0)` baseline)
 - Bird height `y` is **re-centred** on mid-grid `(C.Y-1)/2` before scaling — so 0 = middle, helping the network treat up/down symmetrically
 - All features divided by fixed `scales(C)` constants (no running normaliser — avoids coupling runs to their own history)
 - **`active` flag is essential**: without it, empty pipe slots (sentinel `dx = X`) are indistinguishable from genuinely distant obstacles
 - Observation dim: `2 + 3 × n_preview` (y, v, then dx/dy/active per pipe)
 
+```python
+def _build_observation(state, C, cfg):
+    s = scales(C)
+    y = (state["y"] - (C.Y - 1) / 2) / s["y"]   # re-centred height
+    v = state["v"] / s["v"]                        # scaled velocity
+
+    if cfg.obs_mode == "minimal":
+        dy0 = state["dy"][:, 0] / s["dy"]
+        return np.stack([v, dy0], axis=1).astype(np.float32)
+
+    if cfg.obs_mode != "full":
+        raise ValueError(f"unknown observation mode {cfg.obs_mode!r}")
+
+    P = min(cfg.n_preview, C.M)
+    cols = [y, v]
+    for i in range(P):
+        cols.append(state["dx"][:, i] / s["dx"])          # distance to pipe i
+        cols.append(state["dy"][:, i] / s["dy"])          # gap offset for pipe i
+        cols.append(state["active"][:, i].astype(float))  # activity flag
+    return np.stack(cols, axis=1).astype(np.float32)
+```
+
 #### Task 2 — `compute_gae`
+
 - Implemented as a **backward loop** (t = T-1 → 0) because `A_t` depends on `A_{t+1}`
 - The `(1 - done_t)` mask appears **twice**: once in the TD error (zeroes out next-state value on crash), once in the accumulation (prevents credit leaking across episode boundaries)
 - Returns = advantages + values (critic regression target = full expected return, not just advantage)
 - λ controls the "memory fade" — calibrated analytically in C3
 
+```python
+def _compute_gae(rewards, values, dones, last_value, gamma, lam):
+    T, N = rewards.shape
+    advantages = np.zeros((T, N), dtype=np.float64)
+    last_gae   = np.zeros(N,      dtype=np.float64)
+
+    for t in reversed(range(T)):
+        next_value   = last_value if t == T - 1 else values[t + 1]
+        non_terminal = 1.0 - dones[t]
+        delta        = rewards[t] + gamma * next_value * non_terminal - values[t]
+        last_gae     = delta + gamma * lam * non_terminal * last_gae
+        advantages[t] = last_gae
+
+    returns = advantages + values
+    return advantages, returns
+```
+
 #### Task 3 — `ppo_loss`
+
 - Ratio ρ = `exp(log π_new - log π_old)` computed in log-space for numerical stability
 - Pessimistic clipping: `torch.max(pg_1, pg_2)` — both terms carry a minus sign, so `max` picks the worse (less beneficial) branch, enforcing the leash
 - Value loss: `0.5 * MSE(V, returns)` — the `0.5` matches the gradient scale convention
 - Entropy bonus subtracted (rewarded) to prevent premature policy collapse
 - KL estimator: Schulman's `mean((ρ - 1) - log ρ)` — always ≥ 0, lower variance than `-log ρ`; used in C3 to set learning rate
+
+```python
+def _ppo_loss(old_logprob, new_logprob, advantages, returns,
+              new_value, entropy, cfg):
+    log_ratio = new_logprob - old_logprob
+    ratio     = log_ratio.exp()                                        # ρ = π_new/π_old
+
+    if cfg.norm_adv:
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    pg_1    = -advantages * ratio
+    pg_2    = -advantages * ratio.clamp(1 - cfg.clip_coef,            # clipped branch
+                                         1 + cfg.clip_coef)
+    pg_loss = torch.max(pg_1, pg_2).mean()                            # pessimistic branch
+
+    v_loss  = 0.5 * ((new_value - returns) ** 2).mean()               # critic MSE
+    ent     = entropy.mean()
+    loss    = pg_loss + cfg.vf_coef * v_loss - cfg.ent_coef * ent     # combined loss
+
+    with torch.no_grad():
+        approx_kl = ((ratio - 1) - log_ratio).mean().item()           # Schulman's KL
+        clip_frac = ((ratio - 1.0).abs() > cfg.clip_coef).float().mean().item()
+
+    return loss, {
+        "policy_loss":    pg_loss.item(),
+        "value_loss":     v_loss.item(),
+        "entropy":        ent.item(),
+        "approx_kl":      approx_kl,
+        "clip_fraction":  clip_frac,
+    }
+```
 
 ---
 
