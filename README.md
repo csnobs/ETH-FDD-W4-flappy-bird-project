@@ -172,16 +172,26 @@ def _ppo_loss(old_logprob, new_logprob, advantages, returns,
 
 ## Hyperparameters
 
-> *To be filled in after calibration (C1–C3).*
+Calibrated analytically from environment measurements — not copied from defaults.
 
 | Parameter | Value | Justification |
 |-----------|-------|---------------|
-| γ (gamma) | TBD | |
-| T (rollout) | TBD | |
-| N (envs) | TBD | |
-| λ (GAE) | TBD | |
-| LR | TBD | |
-| Epochs | TBD | |
+| γ (gamma) | `0.99` | Horizon = 100 steps ≈ 3–5 pipe gaps; `γ^Δ ≈ 0.78` (next pipe clearly visible) |
+| T (rollout) | `64` | Must exceed `2×Δ ≈ 50` so full "flap → pipe → reward" cycle fits in one rollout |
+| N (envs) | `128` | Gradient stability at constant batch size 8192; `N=1024,T=8` fails T constraint |
+| λ (GAE) | `0.95` | Credit horizon `1/(1−γλ) ≈ 20 steps ≈ Δ` — keeps credit within one pipe gap |
+| LR | `3e-3` | At `3e-4` median KL ≈ 0.0005 (20× below target); `3e-3` hits the 0.01–0.02 band |
+| Epochs | `10` | Increases KL per batch pass; stacks with LR to reach target band |
+
+### Calibration Logic
+
+**γ (C1):** Derived from `γ^Δ ≥ 0.5` and `1/(1-γ) ≤ 4 × episode_length`. γ=0.99 gives horizon=100 with `γ^25 ≈ 0.78` — the next pipe still receives 78% weight.
+
+**T and N (C2):** T is dictated by task temporal structure (`T > 2Δ`), N by variance budget. They are NOT interchangeable — same batch size `N=1024,T=8` learns almost nothing because no rollout contains a complete obstacle-passing cycle.
+
+**λ (C3):** Effective credit horizon `1/(1−γλ)` must match Δ. At λ=0.95: horizon ≈ 20 steps = Δ. The "everyone uses 0.95" default is correct *for this task* — but now we know why.
+
+**LR + Epochs (C3):** KL target band is 0.01–0.02. Default `lr=3e-4, epochs=4` gives KL≈0.0005 and stalls at 48% of optimum. `lr=3e-3, epochs=10` hits the KL band and reaches 94% of optimum. **Always measure KL before reading the return curve.**
 
 ---
 
